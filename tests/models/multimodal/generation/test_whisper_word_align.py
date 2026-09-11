@@ -268,6 +268,11 @@ def _capturer(num_slots=2, max_frames=4, max_tokens=16, max_tgt=8, wants="abcde"
     cap.positions = torch.zeros(max_tokens, dtype=torch.int64)
     cap._arange = torch.arange(max_tokens, dtype=torch.int32)
     cap._frames = np.arange(max_frames, dtype=np.int64)
+    cap._slot_indices_cpu = torch.empty(max_tokens, dtype=torch.int64)
+    cap._slot_indices_np = cap._slot_indices_cpu.numpy()
+    cap._slot_indices_gpu = torch.empty(max_tokens, dtype=torch.int64)
+    cap._k_indices_cpu = torch.empty(num_slots * max_frames, dtype=torch.int64)
+    cap._k_indices_np = cap._k_indices_cpu.numpy()
     return cap
 
 
@@ -543,6 +548,7 @@ def test_capture_budget_is_a_fraction_of_the_unspent_allowance():
     runner = SimpleNamespace(
         device=torch.device("cpu"),
         cache_config=SimpleNamespace(gpu_memory_utilization=0.5),
+        model_memory_usage=100,
     )
     budget = WordAlignCapturer._capture_budget_bytes(
         runner, memory_info=lambda _dev: (free, total)
@@ -557,10 +563,12 @@ def test_capture_budget_shrinks_with_a_small_utilization():
     runner_low = SimpleNamespace(
         device=torch.device("cpu"),
         cache_config=SimpleNamespace(gpu_memory_utilization=0.1),
+        model_memory_usage=50,
     )
     runner_high = SimpleNamespace(
         device=torch.device("cpu"),
         cache_config=SimpleNamespace(gpu_memory_utilization=0.9),
+        model_memory_usage=50,
     )
     info = lambda _dev: (950, total)  # noqa: E731
     low = WordAlignCapturer._capture_budget_bytes(runner_low, memory_info=info)
@@ -575,11 +583,27 @@ def test_capture_budget_is_zero_when_the_allowance_is_already_spent():
     runner = SimpleNamespace(
         device=torch.device("cpu"),
         cache_config=SimpleNamespace(gpu_memory_utilization=0.1),
+        model_memory_usage=500,
     )
     budget = WordAlignCapturer._capture_budget_bytes(
         runner, memory_info=lambda _dev: (500, 1000)
     )
     assert budget == 0
+
+
+def test_capture_budget_ignores_memory_used_by_other_processes():
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.5),
+        model_memory_usage=100,
+    )
+    mostly_free = WordAlignCapturer._capture_budget_bytes(
+        runner, memory_info=lambda _dev: (900, 1000)
+    )
+    mostly_occupied = WordAlignCapturer._capture_budget_bytes(
+        runner, memory_info=lambda _dev: (200, 1000)
+    )
+    assert mostly_occupied == mostly_free
 
 
 # --- pool exhaustion must not be silent ------------------------------------

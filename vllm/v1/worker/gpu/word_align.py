@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import PIN_MEMORY, get_dtype_size
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -79,15 +80,14 @@ class WordAlignCapturer:
     def _capture_budget_bytes(runner, memory_info: Callable | None = None) -> int:
         """Bytes the capture pool may take: a share of what is still unspent.
 
-        Measured rather than assumed. The allowance is
-        ``total * gpu_memory_utilization``, and the weights are already resident
-        by the time this runs, so ``allowance - already_used`` is what KV cache,
-        activations and capture buffers still have to share.
+        The allowance is ``total * gpu_memory_utilization``. Model memory is
+        measured by the runner, so memory held by unrelated processes sharing
+        the device must not reduce this process's capture budget a second time.
         """
         if memory_info is None:
             memory_info = torch.accelerator.get_memory_info
         try:
-            free, total = memory_info(runner.device)
+            _, total = memory_info(runner.device)
         except Exception:
             # Not fatal: an unreadable budget just falls back to a single slot.
             logger.warning(
@@ -96,7 +96,10 @@ class WordAlignCapturer:
                 exc_info=True,
             )
             return 0
-        unspent = total * runner.cache_config.gpu_memory_utilization - (total - free)
+        unspent = (
+            total * runner.cache_config.gpu_memory_utilization
+            - runner.model_memory_usage
+        )
         return max(0, int(unspent * CAPTURE_MEMORY_FRACTION))
 
     @staticmethod
@@ -164,9 +167,11 @@ class WordAlignCapturer:
 
         gen_config = GenerationConfig.from_pretrained(runner.model_config.model)
         hf_config = runner.model_config.hf_config
+        dtype = runner.model_config.dtype
+        assert isinstance(dtype, torch.dtype)
         max_frames = int(hf_config.max_source_positions)
         slot_bytes = self._slot_bytes(
-            gen_config, hf_config, runner.model_config.dtype.itemsize, max_frames
+            gen_config, hf_config, get_dtype_size(dtype), max_frames
         )
         budget = self._capture_budget_bytes(runner)
         num_slots = self._pool_size(runner.max_num_reqs, budget, slot_bytes)
@@ -177,7 +182,7 @@ class WordAlignCapturer:
             eos_token_id=gen_config.eos_token_id,
             median_filter_width=getattr(hf_config, "median_filter_width", 7),
             device=runner.device,
-            dtype=runner.model_config.dtype,
+            dtype=dtype,
             max_slots=num_slots + 1,
             positions=runner.input_buffers.positions,
             max_k_frames=num_slots * max_frames,
@@ -195,6 +200,23 @@ class WordAlignCapturer:
             runner.max_num_tokens, device=runner.device, dtype=torch.int32
         )
         self._frames = np.arange(max_frames, dtype=np.int64)
+        self._slot_indices_cpu = torch.empty(
+            runner.max_num_reqs,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self._slot_indices_np = self._slot_indices_cpu.numpy()
+        self._slot_indices_gpu = torch.empty(
+            runner.max_num_reqs, dtype=torch.int64, device=runner.device
+        )
+        self._k_indices_cpu = torch.empty(
+            num_slots * max_frames,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self._k_indices_np = self._k_indices_cpu.numpy()
         # Warmup and graph capture run before any real batch: park them.
         self.qidx.fill_(self.scratch * self.max_tgt)
         self.enabled = True
@@ -251,8 +273,10 @@ class WordAlignCapturer:
         )
         # Rows are addressed as slot * max_tgt + position, so scaling the slot
         # here leaves just the position to add once tokens are laid out.
-        slot_gpu = torch.from_numpy(slot_np * self.max_tgt).to(
-            self.qidx.device, non_blocking=True
+        num_reqs = input_batch.num_reqs
+        np.multiply(slot_np, self.max_tgt, out=self._slot_indices_np[:num_reqs])
+        slot_gpu = self._slot_indices_gpu[:num_reqs].copy_(
+            self._slot_indices_cpu[:num_reqs], non_blocking=True
         )
         num_tokens = input_batch.num_tokens
         batch_idx = torch.searchsorted(
@@ -278,7 +302,8 @@ class WordAlignCapturer:
         num_k = prefills.size * self.max_frames
         if num_k and num_k <= self.kidx.shape[0]:
             rows = slot_np[prefills, None] * self.max_frames + self._frames
-            self.kidx[:num_k].copy_(torch.from_numpy(rows.ravel()), non_blocking=True)
+            self._k_indices_np[:num_k] = rows.ravel()
+            self.kidx[:num_k].copy_(self._k_indices_cpu[:num_k], non_blocking=True)
 
     def _report_pool_exhausted(self, req_id: str) -> None:
         """Report that this request will get no word timestamps.
